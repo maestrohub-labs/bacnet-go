@@ -229,6 +229,27 @@ func (c *Client) receiver() {
 		c.handlePacketWG.Add(1)
 		go func() {
 			defer c.handlePacketWG.Done()
+			// Defense-in-depth: a malformed packet that slips past the
+			// bound checks in the decoders must not bring down the
+			// hosting process. The library is used in enterprise BAS
+			// gateways where one rogue device cannot be allowed to crash
+			// the integration. Log the panic with the raw bytes (capped)
+			// so the issue is debuggable, then drop the packet.
+			defer func() {
+				if r := recover(); r != nil {
+					n := len(data)
+					if n > 64 {
+						n = 64
+					}
+					c.metrics.PanicsRecovered.Inc()
+					c.logger.Error("recovered from panic in handlePacket",
+						slog.Any("panic", r),
+						slog.String("remote", addr.String()),
+						slog.Int("packet_len", len(data)),
+						slog.String("packet_head_hex", fmt.Sprintf("%x", data[:n])),
+					)
+				}
+			}()
 			c.handlePacket(data, addr)
 		}()
 	}
@@ -308,60 +329,63 @@ func (c *Client) handleUnconfirmedRequest(apdu *APDU, addr *net.UDPAddr, npdu *N
 	}
 }
 
+// readUnsignedTag decodes the tag header at data[offset:] and reads a
+// length-bounded unsigned-int payload. It bounds-checks the payload slice
+// against len(data) so callers in goroutine-handlers (handleIAm,
+// decodeError, RPM decode) cannot be tricked into a panic by a malformed
+// or truncated packet from the wire.
+func readUnsignedTag(data []byte, offset int) (value uint32, newOffset int, err error) {
+	if offset < 0 || offset > len(data) {
+		return 0, offset, ErrInvalidResponse
+	}
+	_, _, length, headerLen, err := DecodeTagNumber(data[offset:])
+	if err != nil {
+		return 0, offset, err
+	}
+	if length < 0 || offset+headerLen+length > len(data) {
+		return 0, offset, ErrInvalidResponse
+	}
+	value = DecodeUnsigned(data[offset+headerLen : offset+headerLen+length])
+	return value, offset + headerLen + length, nil
+}
+
 // handleIAm handles I-Am responses
 func (c *Client) handleIAm(data []byte, addr *net.UDPAddr, npdu *NPDU) {
 	c.metrics.IAmReceived.Inc()
 
-	if len(data) < 4 {
-		return
-	}
-
-	// Decode device object identifier
+	// Decode device object identifier (application tag, ObjectID, length=4).
 	tagNum, _, length, headerLen, err := DecodeTagNumber(data)
 	if err != nil || tagNum != uint8(TagObjectID) || length != 4 {
 		return
 	}
-
-	oidValue := binary.BigEndian.Uint32(data[headerLen:])
+	if len(data) < headerLen+4 {
+		return
+	}
+	oidValue := binary.BigEndian.Uint32(data[headerLen : headerLen+4])
 	oid := DecodeObjectIdentifier(oidValue)
-
 	if oid.Type != ObjectTypeDevice {
 		return
 	}
 
 	offset := headerLen + 4
 
-	// Decode max APDU length
-	if len(data) < offset+1 {
-		return
-	}
-	tagNum, _, length, headerLen, err = DecodeTagNumber(data[offset:])
+	maxAPDU32, offset, err := readUnsignedTag(data, offset)
 	if err != nil {
 		return
 	}
-	maxAPDU := uint16(DecodeUnsigned(data[offset+headerLen : offset+headerLen+length]))
-	offset += headerLen + length
+	maxAPDU := uint16(maxAPDU32)
 
-	// Decode segmentation supported
-	if len(data) < offset+1 {
-		return
-	}
-	tagNum, _, length, headerLen, err = DecodeTagNumber(data[offset:])
+	segVal, offset, err := readUnsignedTag(data, offset)
 	if err != nil {
 		return
 	}
-	segmentation := Segmentation(DecodeUnsigned(data[offset+headerLen : offset+headerLen+length]))
-	offset += headerLen + length
+	segmentation := Segmentation(segVal)
 
-	// Decode vendor ID
-	if len(data) < offset+1 {
-		return
-	}
-	tagNum, _, length, headerLen, err = DecodeTagNumber(data[offset:])
+	vendorID32, _, err := readUnsignedTag(data, offset)
 	if err != nil {
 		return
 	}
-	vendorID := uint16(DecodeUnsigned(data[offset+headerLen : offset+headerLen+length]))
+	vendorID := uint16(vendorID32)
 
 	// Build device address
 	var deviceAddr Address
@@ -511,29 +535,20 @@ func (c *Client) sendRequest(ctx context.Context, addr *net.UDPAddr, service Con
 	}
 }
 
-// decodeError decodes a BACnet error response
+// decodeError decodes a BACnet error response. All wire-length slices are
+// bound-checked: a malformed or hostile Error PDU must not panic the
+// caller (sendRequest), which would surface as an unrecovered panic up
+// through whatever goroutine made the request.
 func (c *Client) decodeError(data []byte) error {
-	if len(data) < 2 {
-		return ErrInvalidResponse
-	}
-
-	// Decode error class
-	_, _, length, headerLen, err := DecodeTagNumber(data)
+	classVal, off, err := readUnsignedTag(data, 0)
 	if err != nil {
 		return ErrInvalidResponse
 	}
-	errorClass := ErrorClass(DecodeUnsigned(data[headerLen : headerLen+length]))
-
-	offset := headerLen + length
-
-	// Decode error code
-	_, _, length, headerLen, err = DecodeTagNumber(data[offset:])
+	codeVal, _, err := readUnsignedTag(data, off)
 	if err != nil {
 		return ErrInvalidResponse
 	}
-	errorCode := ErrorCode(DecodeUnsigned(data[offset+headerLen : offset+headerLen+length]))
-
-	return NewBACnetError(errorClass, errorCode)
+	return NewBACnetError(ErrorClass(classVal), ErrorCode(codeVal))
 }
 
 // sendUnconfirmedRequest sends an unconfirmed request
@@ -723,7 +738,10 @@ func (c *Client) ReadProperty(ctx context.Context, deviceID uint32, objectID Obj
 	return c.decodeReadPropertyResponse(resp.Data)
 }
 
-// decodeReadPropertyResponse decodes a ReadProperty response
+// decodeReadPropertyResponse decodes a ReadProperty response. Each
+// header position is bounds-checked: opening/closing-tag sentinels
+// (length -1/-2) in the [0]/[1]/[2] slots are rejected so they don't
+// drive offset negative on subsequent slices.
 func (c *Client) decodeReadPropertyResponse(data []byte) (interface{}, error) {
 	if len(data) < 8 {
 		return nil, ErrInvalidResponse
@@ -731,29 +749,36 @@ func (c *Client) decodeReadPropertyResponse(data []byte) (interface{}, error) {
 
 	offset := 0
 
-	// Skip object identifier [0]
+	// Object identifier [0] — context class, real (positive) length.
 	tagNum, class, length, headerLen, err := DecodeTagNumber(data[offset:])
-	if err != nil || tagNum != 0 || class != TagClassContext {
+	if err != nil || tagNum != 0 || class != TagClassContext || length < 0 {
+		return nil, ErrInvalidResponse
+	}
+	if offset+headerLen+length > len(data) {
 		return nil, ErrInvalidResponse
 	}
 	offset += headerLen + length
 
-	// Skip property identifier [1]
+	// Property identifier [1] — context class, real length.
 	tagNum, class, length, headerLen, err = DecodeTagNumber(data[offset:])
-	if err != nil || tagNum != 1 || class != TagClassContext {
+	if err != nil || tagNum != 1 || class != TagClassContext || length < 0 {
+		return nil, ErrInvalidResponse
+	}
+	if offset+headerLen+length > len(data) {
 		return nil, ErrInvalidResponse
 	}
 	offset += headerLen + length
 
-	// Check for optional array index [2]
+	// Optional array index [2] — same constraints if present.
 	if len(data) > offset {
 		tagNum, class, length, headerLen, err = DecodeTagNumber(data[offset:])
-		if err == nil && tagNum == 2 && class == TagClassContext {
+		if err == nil && tagNum == 2 && class == TagClassContext &&
+			length >= 0 && offset+headerLen+length <= len(data) {
 			offset += headerLen + length
 		}
 	}
 
-	// Check for opening tag [3]
+	// Opening tag [3] — must be the construct-open sentinel (length=-1).
 	if len(data) <= offset {
 		return nil, ErrInvalidResponse
 	}
@@ -763,7 +788,6 @@ func (c *Client) decodeReadPropertyResponse(data []byte) (interface{}, error) {
 	}
 	offset++
 
-	// Decode property value
 	return c.decodePropertyValue(data[offset:])
 }
 
@@ -805,24 +829,61 @@ func (c *Client) decodePropertyValue(data []byte) (interface{}, error) {
 		case TagSignedInt:
 			return DecodeSigned(valueData), nil
 		case TagReal:
+			if len(valueData) != 4 {
+				return nil, ErrInvalidResponse
+			}
 			return DecodeReal(valueData), nil
 		case TagDouble:
+			if len(valueData) != 8 {
+				return nil, ErrInvalidResponse
+			}
 			return DecodeDouble(valueData), nil
 		case TagOctetString:
-			return valueData, nil
+			// Return a defensive copy so the caller cannot accidentally
+			// hold a reference into the receiver's read buffer.
+			out := make([]byte, len(valueData))
+			copy(out, valueData)
+			return out, nil
 		case TagCharacterString:
 			return DecodeCharacterString(valueData), nil
+		case TagBitString:
+			return DecodeBitString(valueData)
 		case TagEnumerated:
 			return DecodeUnsigned(valueData), nil
+		case TagDate:
+			if len(valueData) != 4 {
+				return nil, ErrInvalidResponse
+			}
+			return DecodeDate(valueData), nil
+		case TagTime:
+			if len(valueData) != 4 {
+				return nil, ErrInvalidResponse
+			}
+			return DecodeTime(valueData), nil
 		case TagObjectID:
+			if len(valueData) != 4 {
+				return nil, ErrInvalidResponse
+			}
 			oidValue := binary.BigEndian.Uint32(valueData)
 			return DecodeObjectIdentifier(oidValue), nil
 		default:
-			return valueData, nil
+			// Unknown application tag — surface the raw bytes as a copy
+			// so callers don't get pulled into the receiver's buffer.
+			out := make([]byte, len(valueData))
+			copy(out, valueData)
+			return out, nil
 		}
 	}
 
-	return data[headerLen : headerLen+length], nil
+	// Context-class tag with a real (non-sentinel) length. Opening
+	// (-1) and closing (-2) tags can't be surfaced as a value here;
+	// they're structural and the caller should handle them.
+	if length < 0 || len(data) < headerLen+length {
+		return nil, ErrInvalidResponse
+	}
+	out := make([]byte, length)
+	copy(out, data[headerLen:headerLen+length])
+	return out, nil
 }
 
 // WriteProperty writes a property to a BACnet object
@@ -939,110 +1000,129 @@ func (c *Client) ReadPropertyMultiple(ctx context.Context, deviceID uint32, requ
 	return c.decodeReadPropertyMultipleResponse(resp.Data)
 }
 
-// decodeReadPropertyMultipleResponse decodes a ReadPropertyMultiple response
+// decodeReadPropertyMultipleResponse decodes a ReadPropertyMultiple response.
+// All wire-supplied length and offset values are bounds-checked against
+// len(data); a malformed RPM Ack from a peer must not panic the receiver
+// goroutine (the recover() net in handlePacket is the second line of
+// defense, but this function is the first).
 func (c *Client) decodeReadPropertyMultipleResponse(data []byte) ([]PropertyValue, error) {
 	var results []PropertyValue
 	offset := 0
 
 	for offset < len(data) {
-		// Object identifier [0]
-		tagNum, class, length, headerLen, err := DecodeTagNumber(data[offset:])
-		if err != nil {
+		// Object identifier [0] — always context, length 4
+		oidTagNum, oidClass, oidLen, oidHdr, err := DecodeTagNumber(data[offset:])
+		if err != nil || oidTagNum != 0 || oidClass != TagClassContext || oidLen != 4 {
 			break
 		}
-		if tagNum != 0 || class != TagClassContext {
+		if offset+oidHdr+4 > len(data) {
 			break
 		}
-
-		oidValue := binary.BigEndian.Uint32(data[offset+headerLen:])
+		oidValue := binary.BigEndian.Uint32(data[offset+oidHdr : offset+oidHdr+4])
 		oid := DecodeObjectIdentifier(oidValue)
-		offset += headerLen + length
+		offset += oidHdr + 4
 
-		// List of results [1]
-		tagNum, class, length, _, err = DecodeTagNumber(data[offset:])
+		// List of results [1] — opening tag
+		tagNum, class, length, _, err := DecodeTagNumber(data[offset:])
 		if err != nil || tagNum != 1 || class != TagClassContext || length != -1 {
 			break
 		}
 		offset++
 
-		// Parse property results
+		// Per-property loop within this object's result list
+	propertyLoop:
 		for offset < len(data) {
-			tagNum, class, length, _, err = DecodeTagNumber(data[offset:])
+			tagNum, class, length, hdr, err := DecodeTagNumber(data[offset:])
 			if err != nil {
-				break
+				break propertyLoop
 			}
 
-			// Closing tag
+			// Closing tag [1] — end of this object's result list
 			if length == -2 && tagNum == 1 {
 				offset++
-				break
+				break propertyLoop
 			}
 
 			// Property identifier [2]
 			if tagNum != 2 || class != TagClassContext {
-				offset++
-				continue
+				break propertyLoop
 			}
-			offset += headerLen
-			propID := PropertyIdentifier(DecodeUnsigned(data[offset : offset+length]))
-			offset += length
+			if length < 0 || offset+hdr+length > len(data) {
+				break propertyLoop
+			}
+			propID := PropertyIdentifier(DecodeUnsigned(data[offset+hdr : offset+hdr+length]))
+			offset += hdr + length
 
 			// Optional array index [3]
 			var arrayIndex *uint32
-			tagNum, class, length, headerLen, err = DecodeTagNumber(data[offset:])
-			if err == nil && tagNum == 3 && class == TagClassContext {
-				idx := DecodeUnsigned(data[offset+headerLen : offset+headerLen+length])
-				arrayIndex = &idx
-				offset += headerLen + length
+			if offset < len(data) {
+				peekTag, peekClass, peekLen, peekHdr, peekErr := DecodeTagNumber(data[offset:])
+				if peekErr == nil && peekTag == 3 && peekClass == TagClassContext &&
+					peekLen >= 0 && offset+peekHdr+peekLen <= len(data) {
+					idx := DecodeUnsigned(data[offset+peekHdr : offset+peekHdr+peekLen])
+					arrayIndex = &idx
+					offset += peekHdr + peekLen
+				}
 			}
 
-			// Property value [4] or property access error [5]
+			// Property value [4] or property access error [5] — opening tag
+			if offset >= len(data) {
+				break propertyLoop
+			}
 			tagNum, class, length, _, err = DecodeTagNumber(data[offset:])
-			if err != nil {
-				break
+			if err != nil || class != TagClassContext || length != -1 {
+				break propertyLoop
 			}
 
-			if tagNum == 4 && class == TagClassContext && length == -1 {
-				// Property value
+			switch tagNum {
+			case 4:
+				// Property value — decode then skip to closing tag
 				offset++
 				value, _ := c.decodePropertyValue(data[offset:])
-
-				// Skip to closing tag
-				for offset < len(data) {
-					_, _, l, h, _ := DecodeTagNumber(data[offset:])
-					offset += h
-					if l == -2 {
-						break
-					}
-					if l > 0 {
-						offset += l
-					}
-				}
-
+				offset = skipToContextClosingTag(data, offset, 4)
 				results = append(results, PropertyValue{
 					ObjectID:   oid,
 					PropertyID: propID,
 					ArrayIndex: arrayIndex,
 					Value:      value,
 				})
-			} else if tagNum == 5 && class == TagClassContext && length == -1 {
-				// Property access error - skip
+			case 5:
+				// Property access error — skip
 				offset++
-				for offset < len(data) {
-					_, _, l, h, _ := DecodeTagNumber(data[offset:])
-					offset += h
-					if l == -2 {
-						break
-					}
-					if l > 0 {
-						offset += l
-					}
-				}
+				offset = skipToContextClosingTag(data, offset, 5)
+			default:
+				break propertyLoop
 			}
 		}
 	}
 
 	return results, nil
+}
+
+// skipToContextClosingTag advances offset past content until the matching
+// context-class closing tag is seen, then returns the offset just after
+// the closing tag byte. Each step is bounds-checked. If the closing tag
+// is never found, returns len(data) (so the caller's outer loop
+// terminates naturally).
+func skipToContextClosingTag(data []byte, offset int, wantTag uint8) int {
+	for offset < len(data) {
+		tagNum, class, length, hdr, err := DecodeTagNumber(data[offset:])
+		if err != nil {
+			return len(data)
+		}
+		offset += hdr
+		// Closing tag of the expected number?
+		if length == -2 && class == TagClassContext && tagNum == wantTag {
+			return offset
+		}
+		if length > 0 {
+			if offset+length > len(data) {
+				return len(data)
+			}
+			offset += length
+		}
+	}
+	return offset
 }
 
 // SubscribeCOV subscribes to COV (Change of Value) notifications

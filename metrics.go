@@ -208,6 +208,12 @@ type Metrics struct {
 	COVSubscriptions Counter
 	COVNotifications Counter
 
+	// Resilience: count of panics caught by the handlePacket
+	// defense-in-depth recover. A non-zero value here means a malformed
+	// or hostile packet was caught at the goroutine boundary instead of
+	// crashing the process. Useful for ops alerting.
+	PanicsRecovered Counter
+
 	// Latency
 	RequestLatency *LatencyHistogram
 
@@ -270,6 +276,7 @@ func (m *Metrics) Reset() {
 	m.DevicesDiscovered.Reset()
 	m.COVSubscriptions.Reset()
 	m.COVNotifications.Reset()
+	m.PanicsRecovered.Reset()
 	m.RequestLatency.Reset()
 	m.BytesSent.Reset()
 	m.BytesReceived.Reset()

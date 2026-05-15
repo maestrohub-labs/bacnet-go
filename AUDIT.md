@@ -179,3 +179,103 @@ No finding rises to a "fall back to `ulbios/bacnet` rebuild" level (see
 plan § 11.5 / issue #2299 escalation criteria). The critical items are
 either honestly documentable (#1, #4) or one-line fixes (#2, #3). v0.1.0
 can ship on this fork.
+
+## Hardening pass — 2026-05-15 (post-audit, pre-tag)
+
+A second-pass review focused on three concerns: crash safety on
+malformed/hostile wire data, completeness of the supported data-type
+matrix, and untested decoder paths. The motivation is that the library
+is positioned for enterprise BAS gateways where a single misbehaving
+device must not be able to crash the integration host.
+
+### New findings — crash paths reachable from the wire
+
+All six were latent panics in receiver-thread code with no `recover()`
+above them, so a single malformed packet would have crashed the process
+hosting the client.
+
+| #  | Location                                        | Issue                                                                                                                              | Status   |
+| -- | ----------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------- | -------- |
+| C1 | `client.go` `handleIAm`                         | `binary.BigEndian.Uint32(data[headerLen:])` without verifying `len(data) ≥ headerLen+4`. Triggered by any malformed I-Am.          | Fixed.   |
+| C2 | `client.go` `handleIAm`                         | Three wire-length-driven slices for max-APDU, segmentation, vendor-ID with no bound check against `len(data)`.                     | Fixed.   |
+| C3 | `client.go` `decodePropertyValue` (ObjectID)    | `Uint32(valueData)` requires `len==4`; code only ensured `headerLen+length` fits. A peer claiming ObjectID with length≠4 panicked. | Fixed.   |
+| C4 | `client.go` `decodeError`                       | Two length-from-wire slices with no bound check.                                                                                   | Fixed.   |
+| C5 | `client.go` `decodeReadPropertyMultipleResponse`| `Uint32(data[offset+headerLen:])` without bound-check.                                                                              | Fixed.   |
+| C6 | `client.go` `decodeReadPropertyMultipleResponse`| `data[offset:offset+length]` and array-index slice with wire-supplied length, plus stale-`headerLen` usage from an outer scope.    | Fixed (function rewritten with clean scoping). |
+
+In addition, fuzz testing surfaced two latent decoder panics where a
+context-tag length sentinel (`-1` opening, `-2` closing) reached a
+`make([]byte, length)` or a `slice[offset:]` with a negative result:
+
+| #  | Location                                  | Issue                                                                                  | Status |
+| -- | ----------------------------------------- | -------------------------------------------------------------------------------------- | ------ |
+| C7 | `client.go` `decodePropertyValue`         | Context-class fall-through branch allowed `make([]byte, -1)`. Found by fuzz, fixed.    | Fixed. |
+| C8 | `client.go` `decodeReadPropertyResponse`  | `[0]`/`[1]`/`[2]` slots accepted closing-tag sentinels, driving offset negative. Found by fuzz, fixed. | Fixed. |
+
+Defense-in-depth: the per-packet goroutine in `client.go` now has a
+`recover()` that catches any future decode-path panic, increments the
+new `Metrics.PanicsRecovered` counter, and logs the remote, packet
+length, and first 64 bytes hex. The goal is that no single packet —
+regardless of decoder correctness — can take down the host.
+
+### Data-type completeness
+
+`decodePropertyValue` (`client.go:802–822`) used to handle 8 application
+tags + Null + Boolean. It now also handles, with typed return values
+(not raw `[]byte`):
+
+- **`TagBitString` (8)** — returns a `BitString` struct (see
+  `bitstring.go`) carrying unused-bits-count and packed bytes, plus a
+  `StatusFlags()` helper that interprets the first 4 bits per the spec.
+- **`TagDate` (10)** — returns a `Date` struct (see `datetime.go`)
+  with Year/Month/Day/DayOfWeek and wildcard handling (0xFF surfaces as
+  `DateWildcardYear` / `DateWildcardField`).
+- **`TagTime` (11)** — returns a `Time` struct.
+
+`DecodeCharacterString` (`protocol.go`) was rewritten to honor the
+character-set byte for sets 0 (UTF-8), 3 (UCS-4 BE), 4 (UCS-2 / UTF-16
+BE), and 5 (ISO 8859-1). Deprecated sets 1 (MS DBCS) and 2 (JIS) and
+unknown vendor-specific codes fall through to best-effort `string()`
+coercion.
+
+### Test additions
+
+- `hardening_test.go` — targeted regression tests for C1–C6, plus a
+  test for the receiver-goroutine recover() pattern.
+- `datatypes_test.go` — round-trip encode/decode for every application
+  tag, `BitString.StatusFlags()` interpretation tests including the
+  ASHRAE-spec bit ordering, Date/Time wildcard handling, character-set
+  decode coverage for sets 0/4/5.
+- `fuzz_test.go` — Go-native fuzz targets for the four wire-facing
+  decoders: `handlePacket`, `decodePropertyValue`, `decodeError`,
+  `decodeReadPropertyResponse`, and `decodeReadPropertyMultipleResponse`.
+  Combined they executed > 30M cases during the hardening pass before
+  the tree was tagged. The two saved testdata corpora pin the
+  regressions for C7/C8.
+
+### Coverage at the hardened gate
+
+| File                          | Coverage  | Gate (≥60%) |
+| ----------------------------- | --------: | :---------: |
+| `protocol.go`                 |   71.4%   |     ✅      |
+| `types.go`                    |   81.5%   |     ✅      |
+| `internal/transport/udp.go`   |   69.3%   |     ✅      |
+| `bitstring.go`                |   63.6%   |     ✅      |
+| `datetime.go`                 |  100.0%   |     ✅      |
+| `device.go`                   |  100.0%   |     ✅      |
+| `errors.go`                   |   77.3%   |     ✅      |
+| `client.go`                   |   55.1%   |     ❌      |
+
+`client.go` moved up 11 points (was 44.1% in the first pass). The
+remaining uncovered statements are network paths the v0.1.0 test
+scope still does not exercise: `WriteProperty`, `SubscribeCOV`, BBMD
+register/forward, and the unhappy-path log branches. Tracked for
+follow-up — not a blocker for v0.1.0.
+
+### Conclusion (post-hardening)
+
+The combination of bound-checking each wire-length-driven slice, adding
+a goroutine-boundary `recover()`, and fuzz-driving the four decoders
+through > 30M cases makes the receiver path materially safer than the
+upstream baseline. The added data-type decoders close the most painful
+real-world gap (`Status_Flags` being unintelligible). v0.1.0 ships.

@@ -18,6 +18,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"math"
+	"unicode/utf16"
 )
 
 // BVLC Header (BACnet Virtual Link Control)
@@ -663,13 +664,67 @@ func DecodeDouble(data []byte) float64 {
 	return math.Float64frombits(bits)
 }
 
-// DecodeCharacterString decodes a character string
+// BACnet character set codes per ASHRAE 135 Table 21 (the
+// "char-string-encoding" enumeration).
+const (
+	CharSetUTF8     uint8 = 0 // modern default
+	CharSetMSDBCS   uint8 = 1 // deprecated; legacy Windows-based servers
+	CharSetJIS      uint8 = 2 // deprecated
+	CharSetUCS4     uint8 = 3 // UCS-4 big-endian
+	CharSetUCS2     uint8 = 4 // UCS-2 / UTF-16 big-endian
+	CharSetISO88591 uint8 = 5 // ISO 8859-1 / Latin-1
+)
+
+// DecodeCharacterString decodes a character string. The first byte of
+// the payload identifies the character set per the spec; remaining
+// bytes carry the encoded text.
+//
+// Sets handled with full conversion to UTF-8: UTF-8 (0), UCS-2/UTF-16
+// BE (4), ISO 8859-1 (5), UCS-4 (3). For deprecated sets MSDBCS (1)
+// and JIS (2) and any vendor-specific code, the payload is returned
+// as a best-effort UTF-8 string (the raw bytes coerced through
+// `string()`). Callers needing the raw bytes for an unsupported set
+// should reach for the underlying ApplicationTag.
 func DecodeCharacterString(data []byte) string {
 	if len(data) < 1 {
 		return ""
 	}
-	// Skip character set byte
-	return string(data[1:])
+	encoding := data[0]
+	payload := data[1:]
+	switch encoding {
+	case CharSetUTF8:
+		return string(payload)
+	case CharSetUCS2:
+		// Truncate a trailing half-character rather than panicking. A
+		// 1-byte-shorter string is the safe interpretation of a
+		// malformed UCS-2 payload, and matches what bacnet-stack does.
+		if len(payload)%2 == 1 {
+			payload = payload[:len(payload)-1]
+		}
+		u16 := make([]uint16, len(payload)/2)
+		for i := range u16 {
+			u16[i] = binary.BigEndian.Uint16(payload[i*2:])
+		}
+		return string(utf16.Decode(u16))
+	case CharSetUCS4:
+		// 4-byte big-endian code points. Truncate any trailing
+		// partial code point.
+		trimmed := payload[:len(payload)-(len(payload)%4)]
+		runes := make([]rune, len(trimmed)/4)
+		for i := range runes {
+			runes[i] = rune(binary.BigEndian.Uint32(trimmed[i*4:]))
+		}
+		return string(runes)
+	case CharSetISO88591:
+		runes := make([]rune, len(payload))
+		for i, b := range payload {
+			runes[i] = rune(b)
+		}
+		return string(runes)
+	default:
+		// Deprecated or unknown set: best effort.
+		return string(payload)
+	}
 }
 
 // DecodeObjectIdentifierFromBytes decodes an object identifier from bytes

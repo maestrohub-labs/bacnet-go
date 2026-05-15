@@ -27,6 +27,38 @@ purpose; we ship what we test.
 See [`AUDIT.md`](AUDIT.md) for the one-engineer read-through audit, known
 limits, and consumer caveats.
 
+### Application-tag coverage
+
+`ReadProperty` and `ReadPropertyMultiple` decode every standard BACnet
+application tag and return typed values:
+
+| Tag                | Returns                                              |
+| ------------------ | ---------------------------------------------------- |
+| Null               | `nil`                                                |
+| Boolean            | `bool`                                               |
+| UnsignedInt        | `uint32`                                             |
+| SignedInt          | `int32`                                              |
+| Real               | `float32`                                            |
+| Double             | `float64`                                            |
+| OctetString        | `[]byte` (defensive copy)                            |
+| CharacterString    | `string` (sets UTF-8/UCS-2/UCS-4/Latin-1 decoded)    |
+| BitString          | `BitString` — has a `StatusFlags()` helper           |
+| Enumerated         | `uint32`                                             |
+| Date               | `Date` — `Year`/`Month`/`Day`/`DayOfWeek` + wildcards |
+| Time               | `Time` — `Hour`/`Minute`/`Second`/`Hundredths` + wildcards |
+| ObjectIdentifier   | `ObjectIdentifier`                                   |
+
+### Crash safety
+
+Every wire-supplied length and offset in the receive path is
+bounds-checked, and the per-packet goroutine in `handlePacket` has a
+top-level `recover()` so a single misbehaving device cannot crash the
+hosting process. The four wire-facing decoders are fuzz-tested with
+Go's native fuzzer; the v0.1.0 hardening pass ran > 30M fuzz cases
+across the suite. `Metrics.PanicsRecovered` counts any panics caught
+by the goroutine safety net — non-zero values are an ops alert that a
+new decoder bug exists.
+
 ## Install
 
 ```

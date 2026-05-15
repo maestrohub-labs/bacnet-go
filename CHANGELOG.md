@@ -22,6 +22,27 @@ read-through audit and the known-limits / consumer-caveats list.
 - Out-of-band device addressing via `NewRemoteDevice` + `RegisterDevice`
   (skips Who-Is when caller has IP/port/instance up front).
 
+### Application-tag coverage
+
+All decoded with typed return values from `ReadProperty` and
+`ReadPropertyMultiple`:
+
+| Tag | Returns                                  |
+| --- | ---------------------------------------- |
+| Null              | `nil`                          |
+| Boolean           | `bool`                         |
+| UnsignedInt       | `uint32`                       |
+| SignedInt         | `int32`                        |
+| Real              | `float32`                      |
+| Double            | `float64`                      |
+| OctetString       | `[]byte` (defensive copy)      |
+| CharacterString   | `string` (sets 0/3/4/5 decoded)|
+| BitString         | `BitString` (with `StatusFlags()` helper) |
+| Enumerated        | `uint32`                       |
+| Date              | `Date` (with wildcard handling)|
+| Time              | `Time` (with wildcard handling)|
+| ObjectIdentifier  | `ObjectIdentifier`             |
+
 ### Present but not covered by the test suite
 
 - `WriteProperty`, `SubscribeCOV`, `UnsubscribeCOV`, BBMD foreign-device
@@ -79,6 +100,40 @@ read-through audit and the known-limits / consumer-caveats list.
 - `NOTICE`, `FORK.md`, `AUDIT.md`, this `CHANGELOG.md`, `CONTRIBUTING.md`,
   and `SECURITY.md`.
 
+### Fixed (hardening pass — crash paths reachable from the wire)
+
+The pre-release hardening pass identified and fixed six panic sites in
+decoder code that had no `recover()` net above them, plus two more
+discovered by fuzz testing. A goroutine-boundary `recover()` was added
+in `handlePacket` as defense-in-depth so that no single malformed
+packet can crash the host. See `AUDIT.md` "Hardening pass" for the
+complete table.
+
+- **`handleIAm` panic on any malformed I-Am.** `binary.BigEndian.Uint32`
+  and three `DecodeUnsigned` slices read length-from-wire without
+  verifying `len(data)`. Any host on the broadcast domain could crash
+  a client doing `WhoIs`. Fixed; reads now go through a bound-checked
+  `readUnsignedTag` helper.
+- **`decodePropertyValue` panic on ObjectID with length≠4.** A peer
+  claiming `TagObjectID` with a wrong length crashed
+  `Uint32(valueData)`. Fixed; explicit length assertion.
+- **`decodeError` panic on truncated Error PDU.** Two length-from-wire
+  slices, fixed via `readUnsignedTag`.
+- **`decodeReadPropertyMultipleResponse` panic on truncated input.**
+  The whole function was rewritten with clean variable scoping and
+  bounds checks; the old code also had a latent stale-`headerLen` bug
+  that worked accidentally on typical packets.
+- **`decodePropertyValue` panic on context-tag opening/closing
+  sentinels.** Fuzz-found: the context-class fall-through path called
+  `make([]byte, -1)`. Fixed; reject negative length.
+- **`decodeReadPropertyResponse` panic on opening/closing sentinel in
+  [0]/[1]/[2] slots.** Fuzz-found: a closing-tag sentinel as the
+  Object-ID slot drove `offset` negative. Fixed; assert positive
+  length in each header slot.
+
+`Metrics.PanicsRecovered` is a new counter; non-zero values flag that
+the goroutine `recover()` caught something a decoder did not.
+
 ### Fixed (audit-surfaced upstream bugs)
 
 - **AUDIT.md #2 — send-on-closed-channel race in `Close()`.** The
@@ -128,16 +183,38 @@ Per-file statement coverage (unit + integration tests, `-race`):
 
 | File                          | Coverage  | Gate (≥60%) |
 | ----------------------------- | --------: | :---------: |
-| `protocol.go`                 |   67.5%   |     ✅      |
+| `protocol.go`                 |   71.4%   |     ✅      |
 | `types.go`                    |   81.5%   |     ✅      |
 | `internal/transport/udp.go`   |   69.3%   |     ✅      |
-| `client.go`                   |   44.1%   |     ❌      |
+| `bitstring.go`                |   63.6%   |     ✅      |
+| `datetime.go`                 |  100.0%   |     ✅      |
+| `device.go`                   |  100.0%   |     ✅      |
+| `errors.go`                   |   77.3%   |     ✅      |
+| `client.go`                   |   55.1%   |     ❌      |
 
 `client.go` is below the gate because the remaining uncovered statements
 are largely the network paths the v0.1.0 test scope does not exercise:
 `WriteProperty`, `SubscribeCOV`, BBMD register/forward, the
 `handlePacket` error branches for non-Confirmed-Ack PDUs, and the slog
-log lines on the unhappy paths. Tracked as future-work in `AUDIT.md`.
+log lines on the unhappy paths. Coverage of `client.go` rose 11 points
+during the hardening pass (44.1% → 55.1%) — the gap is genuinely
+network-bound and tracked in `AUDIT.md`.
+
+### Fuzz testing
+
+The v0.1.0 release includes Go-native fuzz targets in `fuzz_test.go`
+for the four wire-facing decoders: `handlePacket`,
+`decodePropertyValue`, `decodeError`, `decodeReadPropertyResponse`, and
+`decodeReadPropertyMultipleResponse`. Combined they executed > 30M
+cases during the hardening pass. Saved testdata corpora (under
+`testdata/fuzz/`) pin the two crash regressions discovered during
+fuzzing.
+
+To actively fuzz one decoder, run e.g.:
+
+```
+go test -run='^$' -fuzz=FuzzHandlePacket -fuzztime=30s
+```
 
 ### Audit
 
