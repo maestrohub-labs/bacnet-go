@@ -1,4 +1,5 @@
 // Copyright 2025 Edgeo SCADA
+// Copyright 2026 maestrohub-labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -17,13 +18,13 @@ package bacnet
 // Version information for the bacnet package.
 const (
 	// Version is the current version of the bacnet package.
-	Version = "1.0.0"
+	Version = "0.1.0"
 
 	// VersionMajor is the major version number.
-	VersionMajor = 1
+	VersionMajor = 0
 
 	// VersionMinor is the minor version number.
-	VersionMinor = 0
+	VersionMinor = 1
 
 	// VersionPatch is the patch version number.
 	VersionPatch = 0
