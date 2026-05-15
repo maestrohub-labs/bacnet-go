@@ -74,6 +74,24 @@ End-to-end, in the order the plan specified:
    document the no-op in `CHANGELOG.md` and the README "Caveats" section.
    Future work tracked.
 
+5. **`decodePropertyValue` panics reading any boolean property.** Surfaced
+   by a unit test added during Phase E. The function slices `data[headerLen
+   : headerLen+length]` unconditionally before its application-tag switch
+   (`client.go:786–787`). For `TagBoolean`, the BACnet wire format encodes
+   the boolean value in the *length nibble* of the tag itself with **no
+   separate payload byte** — so a true/false reads as `[0x11]` / `[0x10]`
+   respectively, a single byte. The slice tries to read `data[1:2]` on a
+   1-byte input and panics with "slice bounds out of range." Because
+   `decodePropertyValue` runs inside `handlePacket` (a goroutine spawned
+   per packet), this would crash the receiver and potentially the process
+   on the first boolean property anyone reads.
+
+   *Resolution for v0.1.0:* fixed in this audit pass. The switch now
+   handles `TagNull` and `TagBoolean` before the slice, then bounds-checks
+   the slice for the remaining tag types. Regression covered by
+   `TestDecodePropertyValueScalars/boolean_true` in
+   `coverage_test.go`.
+
 ### Non-critical (track for v0.1.1 or v0.2.0)
 
 | # | Location                          | Issue                                                                                                                     |
@@ -151,6 +169,9 @@ deferred:
   into a closed channel.
 - **D.7** — fix the `decodeReadPropertyResponse` stale-`length` bug at
   `client.go:740`.
+- **D.8** — reorder `decodePropertyValue` so `TagBoolean`/`TagNull` are
+  handled before the payload slice, and bounds-check the slice for the
+  remaining tag types.
 
 ## Conclusion
 

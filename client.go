@@ -784,13 +784,22 @@ func (c *Client) decodePropertyValue(data []byte) (interface{}, error) {
 	}
 
 	if class == TagClassApplication {
-		valueData := data[headerLen : headerLen+length]
-
+		// Null and Boolean encode their value in the tag itself (length
+		// nibble carries the boolean value or zero); they have no
+		// separate payload, so handle them before slicing the payload.
 		switch ApplicationTag(tagNum) {
 		case TagNull:
 			return nil, nil
 		case TagBoolean:
 			return length == 1, nil
+		}
+
+		if len(data) < headerLen+length {
+			return nil, ErrInvalidResponse
+		}
+		valueData := data[headerLen : headerLen+length]
+
+		switch ApplicationTag(tagNum) {
 		case TagUnsignedInt:
 			return DecodeUnsigned(valueData), nil
 		case TagSignedInt:

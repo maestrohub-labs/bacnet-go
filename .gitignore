@@ -36,3 +36,4 @@ Thumbs.db
 
 # Vendor (if not using modules)
 vendor/
+cover.out
