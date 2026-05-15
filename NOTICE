@@ -1,0 +1,13 @@
+bacnet-go
+Copyright 2026 maestrohub-labs
+
+This product is a derivative work of:
+
+  edgeo-scada/bacnet
+  Copyright 2025 Edgeo SCADA
+  Licensed under the Apache License, Version 2.0
+  https://github.com/edgeo-scada/bacnet
+
+Modifications by maestrohub-labs are also licensed under the Apache License,
+Version 2.0. See LICENSE for the full text and FORK.md for a summary of
+significant changes.
