@@ -79,6 +79,10 @@ type Client struct {
 	receiverCtx    context.Context
 	receiverCancel context.CancelFunc
 	receiverDone   chan struct{}
+
+	// In-flight packet-handler goroutines. Close() waits on this to
+	// prevent handleResponse from racing into a closed pending channel.
+	handlePacketWG sync.WaitGroup
 }
 
 // COVHandler is called when a COV notification is received
@@ -155,11 +159,15 @@ func (c *Client) Close() error {
 	c.state.Store(int32(StateDisconnected))
 	c.metrics.Disconnects.Inc()
 
-	// Stop receiver
+	// Stop receiver. Order matters: cancel the receiver loop, wait for it
+	// to exit, then drain any handlePacket goroutines it spawned, then
+	// close the pending channels. Without the WG wait, handleResponse can
+	// race into a closed channel and panic.
 	if c.receiverCancel != nil {
 		c.receiverCancel()
 		<-c.receiverDone
 	}
+	c.handlePacketWG.Wait()
 
 	// Close pending requests
 	c.pendingMu.Lock()
@@ -218,7 +226,11 @@ func (c *Client) receiver() {
 		c.metrics.BytesReceived.Add(int64(len(data)))
 		c.metrics.RecordActivity()
 
-		go c.handlePacket(data, addr)
+		c.handlePacketWG.Add(1)
+		go func() {
+			defer c.handlePacketWG.Done()
+			c.handlePacket(data, addr)
+		}()
 	}
 }
 
@@ -735,7 +747,7 @@ func (c *Client) decodeReadPropertyResponse(data []byte) (interface{}, error) {
 
 	// Check for optional array index [2]
 	if len(data) > offset {
-		tagNum, class, _, headerLen, err = DecodeTagNumber(data[offset:])
+		tagNum, class, length, headerLen, err = DecodeTagNumber(data[offset:])
 		if err == nil && tagNum == 2 && class == TagClassContext {
 			offset += headerLen + length
 		}

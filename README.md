@@ -21,7 +21,7 @@ purpose; we ship what we test.
 | `ReadPropertyMultiple`   | Supported and tested.                                                        |
 | `WhoIs` / device discovery | Supported and exercised by the example; tested at integration level.       |
 | `WriteProperty`          | Present in upstream; **not covered by our test suite**. Use at your own risk. |
-| `SubscribeCOV` / `UnsubscribeCOV` | Present in upstream; **not covered by our test suite**.             |
+| `SubscribeCOV` / `UnsubscribeCOV` | **Broken upstream.** The subscription request is sent on the wire, but the inbound notification handler is a TODO stub (`client.go`). Registered `COVHandler` callbacks will never fire. We left the API surface in place to avoid spurious breakage but do not recommend depending on it. See `AUDIT.md` finding #1. |
 | BBMD foreign-device registration | Present in upstream; **not covered by our test suite**.             |
 
 See [`AUDIT.md`](AUDIT.md) for the one-engineer read-through audit, known
@@ -86,13 +86,27 @@ func main() {
 
 A runnable copy lives at [`examples/read/main.go`](examples/read/main.go).
 
-> **Caveat — device addressing requires Who-Is first.** `ReadProperty` is keyed
-> on a numeric device-instance ID; the client resolves that ID to an IP/port
-> via its internal device cache, which is populated by `WhoIs`. If you call
-> `ReadProperty` against an unknown device ID, the client transparently issues
-> a `WhoIs` on the local subnet to discover it. A direct
-> "I-already-know-the-IP" registration helper is not yet exposed in v0.1.0;
-> see `AUDIT.md` for details.
+### Out-of-band addressing (no Who-Is required)
+
+If you already know the device's IP, port, and instance number, register
+it directly with the client and skip discovery:
+
+```go
+client.RegisterDevice(bacnet.NewRemoteDevice(
+    /* deviceID */ 1234,
+    /* ip       */ net.ParseIP("192.168.1.50"),
+    /* port     */ bacnet.DefaultPort,
+))
+
+// Now ReadProperty(ctx, 1234, ...) resolves directly to 192.168.1.50:47808
+// without issuing a Who-Is broadcast.
+```
+
+`ReadProperty` is keyed on the numeric device-instance ID. The client resolves
+that ID to an IP/port via its internal device cache. The cache is populated
+either by `WhoIs` discovery or by an explicit `RegisterDevice` call. If you
+call `ReadProperty` against an unknown device ID and have not pre-registered
+it, the client transparently issues a `WhoIs` on the local subnet to find it.
 
 ## Caveats
 
@@ -107,6 +121,14 @@ A runnable copy lives at [`examples/read/main.go`](examples/read/main.go).
   guard itself (it is consumer-layer policy).
 - **No CGo.** Pure Go only. The library builds cleanly with `CGO_ENABLED=0`.
 - **Dependency surface.** Module `require` block is empty — stdlib only.
+- **`WithRetries` is a no-op.** Setting `bacnet.WithRetries(n)` accepts the
+  argument but no retry loop exists; failed requests are not retried. To be
+  fixed in a later release.
+- **Default `LocalAddress` binds to an ephemeral port,** not BACnet/IP port
+  47808. This is fine for client-initiated reads (responses come back to the
+  source port) but means the client will not receive unsolicited traffic
+  addressed to port 47808. Pass `bacnet.WithLocalAddress(":47808")` if you
+  need that.
 
 ## Running the tests
 

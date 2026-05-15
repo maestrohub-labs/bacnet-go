@@ -26,6 +26,17 @@ const DefaultPort = 47808
 // MaxAPDULength is the maximum APDU length for BACnet/IP
 const MaxAPDULength = 1476
 
+// ArrayAll is the BACnet sentinel for "read or write the whole array
+// rather than a single element." Per BACnet spec § 12, an ArrayIndex
+// of 0xFFFFFFFF on a ReadProperty/WriteProperty request asks the server
+// for the array as a whole, even when the property is array-valued.
+//
+// Note: passing no ArrayIndex (i.e. nil in ReadOptions.ArrayIndex) is
+// the more common idiom; the server reads the whole property in that
+// case too. Use ArrayAll only when you need to explicitly distinguish
+// "read all elements of this array property" from "read this property".
+const ArrayAll uint32 = 0xFFFFFFFF
+
 // BVLC Types (BACnet Virtual Link Control)
 type BVLCType uint8
 
